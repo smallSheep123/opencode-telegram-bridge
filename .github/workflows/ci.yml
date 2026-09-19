@@ -12,10 +12,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "20"
 
@@ -27,15 +27,4 @@ jobs:
 
       - name: Parse PowerShell scripts
         shell: powershell
-        run: |
-          $errors = @()
-          Get-ChildItem -Recurse -Filter '*.ps1' | ForEach-Object {
-            $tokens = $null
-            $parseErrors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors)
-            if ($parseErrors) { $errors += $parseErrors }
-          }
-          if ($errors.Count) {
-            $errors | Format-List
-            exit 1
-          }
+        run: .\tests\parse-powershell.ps1

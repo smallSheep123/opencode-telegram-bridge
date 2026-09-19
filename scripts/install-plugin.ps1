@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Source = "$PSScriptRoot\..\opencode-plugin\telegram-bridge.js",
     [string]$Destination = "$env:USERPROFILE\.config\opencode\plugins\telegram-bridge.js"

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$DataRoot = "$env:USERPROFILE\.config\opencode\telegram-bridge"
 )

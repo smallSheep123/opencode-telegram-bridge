@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('setup','start','stop','restart','status','logs','doctor','uninstall','install-plugin')]
     [string]$Action = 'status'
