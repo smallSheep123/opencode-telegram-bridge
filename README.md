@@ -23,7 +23,7 @@ A local, Windows-first bridge between OpenCode Desktop and Telegram. It sends co
 
 - Windows 10 or Windows 11.
 - OpenCode Desktop.
-- Node.js 20 or newer available as `node.exe`.
+- Node.js 20 or newer available as `node.exe`. Node.js 24 or newer is recommended when Telegram must use the Windows system proxy.
 - A Telegram bot created with [@BotFather](https://t.me/BotFather).
 
 The current release is designed for OpenCode Desktop's local session API and global plugin directory. OpenCode updates may change these interfaces; run the included doctor command after upgrading OpenCode.
@@ -44,6 +44,8 @@ The setup process:
 - stores encrypted configuration under `%USERPROFILE%\.config\opencode\telegram-bridge`;
 - restricts that directory to the current user, SYSTEM, and local administrators;
 - registers the **OpenCode Telegram Bridge** scheduled task for logon startup.
+
+The scheduled-task launcher imports an enabled Windows/WinINET HTTP proxy before starting Node.js. This supports local Clash-compatible proxy ports without writing proxy addresses into the bridge configuration. Loopback OpenCode traffic remains excluded from the proxy. If Telegram or the proxy is temporarily unavailable, the controller stays alive, keeps completion events on disk, and retries with exponential backoff.
 
 ## Telegram commands
 

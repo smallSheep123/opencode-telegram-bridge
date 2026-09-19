@@ -21,7 +21,7 @@
 
 - Windows 10 或 Windows 11。
 - OpenCode Desktop。
-- Node.js 20 或更新版本，并能通过 `node.exe` 启动。
+- Node.js 20 或更新版本，并能通过 `node.exe` 启动。如果 Telegram 需要使用 Windows 系统代理，建议使用 Node.js 24 或更新版本。
 - 通过 [@BotFather](https://t.me/BotFather) 创建的 Telegram Bot。
 
 本项目依赖 OpenCode Desktop 的本机会话接口和全局插件目录。升级 OpenCode 后建议运行一次“自检”。
@@ -42,6 +42,8 @@
 - 把加密配置保存到 `%USERPROFILE%\.config\opencode\telegram-bridge`；
 - 将该目录权限限制为当前用户、SYSTEM 和本机管理员；
 - 创建登录后自动运行的 `OpenCode Telegram Bridge` 计划任务。
+
+计划任务启动器会自动读取已启用的 Windows/WinINET HTTP 代理，因此可以直接使用本机 Clash 一类的代理端口，不需要把代理地址写进桥接配置。访问本机 OpenCode 的回环流量仍会绕过代理。Telegram 或代理临时离线时，控制器会保持运行，把完成事件保存在磁盘并按指数退避自动重试。
 
 ## Telegram 命令
 

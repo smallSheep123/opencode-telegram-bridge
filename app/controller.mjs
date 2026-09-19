@@ -285,6 +285,23 @@ async function main() {
   if (!config?.allowedUserId || !config?.allowedChatId || !config?.botTokenProtected) throw new Error("桥接配置不完整")
   const botToken = decryptToken()
   const apiBase = `https://api.telegram.org/bot${botToken}`
+  const botCommands = [
+    { command: "sessions", description: "列出最近的 OpenCode 会话" },
+    { command: "find", description: "按标题或项目目录搜索会话" },
+    { command: "current", description: "查看当前选择的会话" },
+    { command: "show", description: "查看当前会话进展" },
+    { command: "send", description: "向当前会话发送一条指令" },
+    { command: "add", description: "向当前会话队列追加一条指令" },
+    { command: "batch", description: "按 --- 分隔并依次执行多条指令" },
+    { command: "queue", description: "查看当前会话的指令队列" },
+    { command: "pause", description: "暂停当前会话的自动队列" },
+    { command: "resume", description: "恢复当前会话的自动队列" },
+    { command: "clearqueue", description: "清空等待中的队列指令" },
+    { command: "stop", description: "停止当前会话的运行" },
+    { command: "status", description: "查看桥接状态" },
+    { command: "health", description: "查看完整健康状态" },
+    { command: "help", description: "显示帮助" },
+  ]
   const state = readJson(statePath, { updateOffset: 0, selected: null, sessionMap: [] })
   state.queues ||= {}
   state.queueInFlight ||= {}
@@ -295,6 +312,8 @@ async function main() {
   state.sessionBrowser ||= { mode: "sessions", query: "", page: 1 }
   state.lastError ||= null
   const startedAt = new Date().toISOString()
+  let telegramReady = false
+  let telegramFailureCount = 0
 
   async function telegram(method, body = {}) {
     const response = await requestJson(`${apiBase}/${method}`, {
@@ -677,16 +696,21 @@ async function main() {
   async function telegramLoop() {
     while (true) {
       try {
+        if (!telegramReady) await configureTelegram(false)
         const updates = await telegram("getUpdates", { offset: Number(state.updateOffset || 0), timeout: 30, allowed_updates: ["message", "callback_query"] })
+        if (telegramFailureCount > 0) log("INFO", `Telegram connection restored after ${telegramFailureCount} failure(s)`)
+        telegramFailureCount = 0
         for (const update of updates || []) {
           try { await processUpdate(update) } catch (error) { recordError("telegram-command", error); log("ERROR", `处理 Telegram 更新失败：${error.stack || error.message}`); await send(`操作失败：${compact(error.message, 500)}`).catch(() => {}) }
           state.updateOffset = Number(update.update_id) + 1
           saveState()
         }
       } catch (error) {
+        telegramReady = false
+        telegramFailureCount += 1
         recordError("telegram-polling", error)
-        log("WARN", `Telegram 轮询失败：${error.message}`)
-        await sleep(5000)
+        if (telegramFailureCount === 1 || telegramFailureCount % 10 === 0) log("WARN", `Telegram 轮询失败（连续 ${telegramFailureCount} 次）：${error.message}`)
+        await sleep(Math.min(60000, 5000 * (2 ** Math.min(telegramFailureCount - 1, 4))))
       }
     }
   }
@@ -855,26 +879,20 @@ async function main() {
     }
   }
 
-  const me = await telegram("getMe")
-  await telegram("setMyCommands", { commands: [
-    { command: "sessions", description: "列出最近的 OpenCode 会话" },
-    { command: "find", description: "按标题或项目目录搜索会话" },
-    { command: "current", description: "查看当前选择的会话" },
-    { command: "show", description: "查看当前会话进展" },
-    { command: "send", description: "向当前会话发送一条指令" },
-    { command: "add", description: "向当前会话队列追加一条指令" },
-    { command: "batch", description: "按 --- 分隔并依次执行多条指令" },
-    { command: "queue", description: "查看当前会话的指令队列" },
-    { command: "pause", description: "暂停当前会话的自动队列" },
-    { command: "resume", description: "恢复当前会话的自动队列" },
-    { command: "clearqueue", description: "清空等待中的队列指令" },
-    { command: "stop", description: "停止当前会话的运行" },
-    { command: "status", description: "查看桥接状态" },
-    { command: "health", description: "查看完整健康状态" },
-    { command: "help", description: "显示帮助" },
-  ] }).catch((error) => log("WARN", `更新 Telegram 命令菜单失败: ${error.message}`))
-  log("INFO", `bridge started bot=@${me.username}`)
-  await send("OpenCode Telegram Bridge 已上线。发送 /sessions 查看会话。")
+  async function configureTelegram(announce) {
+    const me = await telegram("getMe")
+    await telegram("setMyCommands", { commands: botCommands })
+    telegramReady = true
+    log("INFO", `bridge connected bot=@${me.username}`)
+    if (announce) await send("OpenCode Telegram Bridge 已上线。发送 /sessions 查看会话。")
+  }
+
+  try {
+    await configureTelegram(true)
+  } catch (error) {
+    recordError("telegram-startup", error)
+    log("WARN", `Telegram 启动连接失败；桥接保持运行并自动重试：${error.message}`)
+  }
   await Promise.all([telegramLoop(), eventLoop(), recoveryLoop()])
 }
 

@@ -16,10 +16,15 @@ Local controller
   └─ sends notifications and inline actions
 
 Windows Task Scheduler
-  └─ starts and restarts the controller for the logged-in user
+  └─ proxy-aware PowerShell launcher
+       ├─ imports the enabled Windows/WinINET proxy
+       ├─ excludes loopback OpenCode traffic
+       └─ starts and restarts the controller for the logged-in user
 ```
 
 The OpenCode plugin never reads the Telegram token. The controller never listens on a TCP port. The two components exchange instance registrations and completion events through an ACL-restricted local data directory.
+
+Telegram connectivity is retried with bounded exponential backoff. A network outage does not terminate the controller or delete pending event files, so notifications can be delivered when the proxy or network returns.
 
 ## Local data
 

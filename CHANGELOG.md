@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.1.1 - 2026-09-19
+
+### Fixed
+
+- Import the enabled Windows/WinINET proxy for the controller, including local Clash-compatible HTTP proxy settings.
+- Keep the bridge process alive when Telegram is temporarily unreachable and retry with exponential backoff.
+- Reduce repeated network-failure log noise while retaining the latest health error.
+- Preserve queued completion events during an outage and deliver them after connectivity returns.
+- Run service diagnostics through the same proxy-aware launcher as the scheduled task.
+
 ## 0.1.0 - 2026-09-19
 
 ### Added

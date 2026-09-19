@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $TaskName = 'OpenCode Telegram Bridge'
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $Controller = Join-Path $Root 'app\controller.mjs'
+$Runner = Join-Path $Root 'app\run-controller.ps1'
 $DataRoot = "$env:USERPROFILE\.config\opencode\telegram-bridge"
 $ConfigPath = Join-Path $DataRoot 'config.json'
 
@@ -40,7 +41,9 @@ switch ($Action) {
     'install' {
         if (-not (Test-Path -LiteralPath $ConfigPath)) { throw 'Telegram 尚未初始化，请先运行首次配置。' }
         $node = (Get-Command node.exe -ErrorAction Stop).Source
-        $taskAction = New-ScheduledTaskAction -Execute $node -Argument "`"$Controller`"" -WorkingDirectory $Root
+        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        $runnerArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Runner`" -Mode run -ControllerPath `"$Controller`" -NodePath `"$node`""
+        $taskAction = New-ScheduledTaskAction -Execute $powershell -Argument $runnerArgs -WorkingDirectory $Root
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
         $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -59,8 +62,8 @@ switch ($Action) {
     }
     'doctor' {
         $node = (Get-Command node.exe -ErrorAction Stop).Source
-        & $node $Controller --self-test
-        if(Test-Path $ConfigPath){& $node $Controller --check}else{Write-Host 'NOT_CONFIGURED：程序自检通过，等待 Bot Token 初始化。'}
+        & $Runner -Mode self-test -ControllerPath $Controller -NodePath $node
+        if(Test-Path $ConfigPath){& $Runner -Mode check -ControllerPath $Controller -NodePath $node}else{Write-Host 'NOT_CONFIGURED：程序自检通过，等待 Bot Token 初始化。'}
         $plugin = "$env:USERPROFILE\.config\opencode\plugins\telegram-bridge.js"
         Write-Host "PLUGIN=$(if(Test-Path $plugin){'OK'}else{'MISSING'})"
         Show-Status
