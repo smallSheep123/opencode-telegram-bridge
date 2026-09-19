@@ -1,0 +1,28 @@
+# Security policy
+
+## Supported version
+
+Security fixes are applied to the latest version on the default branch.
+
+## Reporting a vulnerability
+
+Please use GitHub's private vulnerability reporting feature for this repository. Do not open a public issue containing a Telegram token, chat ID, OpenCode credential, local path, private prompt, or proof-of-concept that exposes another user's data.
+
+Include the affected commit, Windows version, OpenCode Desktop version, reproduction steps, and the security impact. Remove all real credentials from logs and screenshots.
+
+## Security boundaries
+
+- The bridge is intended for one Windows user and one bound Telegram private chat.
+- It does not provide multi-user authorization or role-based access control.
+- It accepts OpenCode endpoints only on HTTP loopback addresses.
+- It does not listen for inbound network traffic.
+- Telegram Bot tokens and OpenCode Desktop temporary credentials are protected with Windows DPAPI for the current user.
+- Runtime files are restricted to the current user, SYSTEM, and local administrators during setup.
+- Anyone who can act as the configured Windows user or local administrator is inside the local trust boundary.
+
+## Operational guidance
+
+- Use a dedicated Telegram bot for this bridge.
+- Revoke and replace the BotFather token if it is ever pasted into an issue, terminal recording, public log, or repository.
+- Do not commit `%USERPROFILE%\.config\opencode\telegram-bridge`.
+- Run `bridge.ps1 -Action doctor` after updating OpenCode Desktop or Node.js.

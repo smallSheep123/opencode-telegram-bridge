@@ -1,0 +1,932 @@
+import { createHash, randomUUID } from "node:crypto"
+import { spawnSync } from "node:child_process"
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
+
+const appDir = dirname(fileURLToPath(import.meta.url))
+const dataRoot = process.env.OPENCODE_TELEGRAM_DATA_DIR || join(homedir(), ".config", "opencode", "telegram-bridge")
+const configPath = process.env.OPENCODE_TELEGRAM_CONFIG || join(dataRoot, "config.json")
+const statePath = join(dataRoot, "state.json")
+const instancesDir = join(dataRoot, "instances")
+const eventsDir = join(dataRoot, "events")
+const logsDir = join(dataRoot, "logs")
+const lockPath = join(dataRoot, "controller.lock")
+const decryptScript = join(appDir, "decrypt-token.ps1")
+const credentialCache = new Map()
+
+function cleanWindowsPowerShellEnv() {
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) if (key.toLowerCase() === "psmodulepath") delete env[key]
+  return env
+}
+
+function ensureDirectories() {
+  for (const dir of [dataRoot, instancesDir, eventsDir, logsDir]) mkdirSync(dir, { recursive: true, mode: 0o700 })
+}
+
+function atomicJson(path, value) {
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`
+  writeFileSync(temp, JSON.stringify(value, null, 2), { encoding: "utf8", mode: 0o600 })
+  renameSync(temp, path)
+}
+
+function readJson(path, fallback = null) {
+  try {
+    const text = readFileSync(path, "utf8").replace(/^\uFEFF/, "")
+    return JSON.parse(text)
+  } catch {
+    return fallback
+  }
+}
+
+function redact(value) {
+  return String(value).replace(/bot\d+:[A-Za-z0-9_-]+/g, "bot<redacted>").replace(/\d{8,12}:[A-Za-z0-9_-]{20,}/g, "<token-redacted>")
+}
+
+function log(level, message) {
+  const path = join(logsDir, `bridge-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}.log`)
+  writeFileSync(path, `${new Date().toISOString()} [${level}] ${redact(message)}\n`, { encoding: "utf8", flag: "a", mode: 0o600 })
+}
+
+function acquireLock() {
+  try {
+    const fd = openSync(lockPath, "wx", 0o600)
+    writeFileSync(fd, String(process.pid))
+    closeSync(fd)
+  } catch (error) {
+    const oldPid = Number.parseInt(readFileSync(lockPath, "utf8"), 10)
+    let alive = false
+    if (Number.isFinite(oldPid)) {
+      try { process.kill(oldPid, 0); alive = true } catch {}
+    }
+    if (alive) throw new Error(`另一个桥接进程正在运行，PID=${oldPid}`)
+    rmSync(lockPath, { force: true })
+    return acquireLock()
+  }
+}
+
+function releaseLock() {
+  try {
+    const value = readFileSync(lockPath, "utf8").trim()
+    if (value === String(process.pid)) rmSync(lockPath, { force: true })
+  } catch {}
+}
+
+function decryptToken() {
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", decryptScript, "-ConfigPath", configPath], {
+    encoding: "utf8",
+    env: cleanWindowsPowerShellEnv(),
+    windowsHide: true,
+    timeout: 15000,
+  })
+  if (result.status !== 0) throw new Error(`无法解密 Telegram Token：${redact(result.stderr || result.stdout)}`)
+  const token = result.stdout.trim()
+  if (!/^\d{8,12}:[A-Za-z0-9_-]{20,}$/.test(token)) throw new Error("Telegram Token 格式无效")
+  return token
+}
+
+function decryptProtectedValue(value) {
+  if (!value) return null
+  if (credentialCache.has(value)) return credentialCache.get(value)
+  const script = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Security;$cipher=[Console]::In.ReadToEnd().Trim();$protected=[Convert]::FromBase64String($cipher);$bytes=[Security.Cryptography.ProtectedData]::Unprotect($protected,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.Write([Text.Encoding]::UTF8.GetString($bytes));[Array]::Clear($bytes,0,$bytes.Length)"
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    input: String(value),
+    encoding: "utf8",
+    env: cleanWindowsPowerShellEnv(),
+    windowsHide: true,
+    timeout: 15000,
+  })
+  if (result.status !== 0) throw new Error("无法解密 OpenCode 本机认证信息")
+  const plain = result.stdout
+  credentialCache.set(value, plain)
+  return plain
+}
+
+export function loopbackBase(value) {
+  const url = new URL(String(value))
+  const host = url.hostname.toLowerCase()
+  if (url.protocol !== "http:" || !["127.0.0.1", "localhost", "::1"].includes(host)) throw new Error("拒绝访问非本机 OpenCode 服务")
+  url.pathname = "/"
+  url.search = ""
+  url.hash = ""
+  return url.toString().replace(/\/$/, "")
+}
+
+export function parseCommand(text) {
+  const value = String(text || "").trim()
+  let match
+  if (/^\/(start|help)(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "help" }
+  if (/^\/status(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "status" }
+  if ((match = value.match(/^\/sessions(?:@[A-Za-z0-9_]+)?(?:\s+([1-9]\d{0,3}))?$/i))) return { name: "sessions", arg: Number.parseInt(match[1] || "1", 10) }
+  if ((match = value.match(/^\/find(?:@[A-Za-z0-9_]+)?\s+([\s\S]{1,120})$/i))) return { name: "find", arg: match[1].trim() }
+  if ((match = value.match(/^\/use(?:@[A-Za-z0-9_]+)?\s+([A-Za-z0-9_-]{1,80})$/i))) return { name: "use", arg: match[1] }
+  if (/^\/current(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "current" }
+  if (/^\/show(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "show" }
+  if ((match = value.match(/^\/send(?:@[A-Za-z0-9_]+)?\s+([\s\S]{1,3500})$/i))) return { name: "send", arg: match[1].trim() }
+  if ((match = value.match(/^\/add(?:@[A-Za-z0-9_]+)?\s+([\s\S]{1,3500})$/i))) return { name: "add", arg: match[1].trim() }
+  if ((match = value.match(/^\/batch(?:@[A-Za-z0-9_]+)?\s+([\s\S]+)$/i))) return { name: "batch", arg: match[1].trim() }
+  if (/^\/queue(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "queue" }
+  if ((match = value.match(/^\/remove(?:@[A-Za-z0-9_]+)?\s+([1-9]\d{0,2})$/i))) return { name: "remove", arg: Number.parseInt(match[1], 10) }
+  if (/^\/pause(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "pause" }
+  if (/^\/resume(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "resume" }
+  if (/^\/clearqueue(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "clearqueue" }
+  if (/^\/stop(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "stop" }
+  if (/^\/health(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "health" }
+  return null
+}
+
+export function parseBatch(value, limit = 20) {
+  const parts = String(value || "").split(/^\s*---\s*$/m).map((part) => part.trim()).filter(Boolean)
+  if (!parts.length) throw new Error("批量指令不能为空")
+  if (parts.length > limit) throw new Error(`一次最多提交 ${limit} 条指令`)
+  if (parts.some((part) => part.length > 3500)) throw new Error("每条指令最多 3500 个字符")
+  return parts
+}
+
+function compact(text, max = 3600) {
+  const value = String(text || "").replace(/\0/g, "").trim()
+  return value.length > max ? `${value.slice(0, max)}\n…（已截断）` : value
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }
+
+function durationText(start, end = Date.now()) {
+  const elapsed = Math.max(0, end - Date.parse(start || 0))
+  const seconds = Math.round(elapsed / 1000)
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
+}
+
+function eventFingerprint(event) {
+  const summary = event?.summary || {}
+  return createHash("sha256").update(JSON.stringify({
+    type: event?.type,
+    sessionId: event?.sessionId,
+    excerpt: event?.excerpt || "",
+    error: event?.error || "",
+    files: summary.files || 0,
+    additions: summary.additions || 0,
+    deletions: summary.deletions || 0,
+  })).digest("hex").slice(0, 24)
+}
+
+async function requestJson(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    if (response.status === 204) return null
+    return await response.json()
+  } finally { clearTimeout(timer) }
+}
+
+function sessionUrl(session, path) {
+  const base = loopbackBase(session.serverUrl)
+  const query = new URLSearchParams({ directory: session.directory || "" })
+  return `${base}${path}?${query}`
+}
+
+function findInstanceFor(session) {
+  const base = loopbackBase(session.serverUrl)
+  return loadInstances().find((item) => loopbackBase(item.serverUrl) === base && String(item.directory || "") === String(session.directory || ""))
+    || loadInstances().find((item) => loopbackBase(item.serverUrl) === base)
+}
+
+function openCodeHeaders(session, headers = {}) {
+  const source = session.auth ? session : findInstanceFor(session)
+  if (!source?.auth?.passwordProtected) return { ...headers }
+  if (source.auth.kind !== "windows-dpapi-basic") throw new Error("不支持的 OpenCode 本机认证方式")
+  const username = source.auth.username || "opencode"
+  const password = decryptProtectedValue(source.auth.passwordProtected)
+  return { ...headers, authorization: `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}` }
+}
+
+function requestSessionJson(session, path, options = {}, timeoutMs = 12000) {
+  return requestJson(sessionUrl(session, path), { ...options, headers: openCodeHeaders(session, options.headers || {}) }, timeoutMs)
+}
+
+function loadInstances() {
+  const now = Date.now()
+  return readdirSync(instancesDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => readJson(join(instancesDir, entry.name)))
+    .filter(Boolean)
+    .filter((item) => now - Date.parse(item.updatedAt || 0) < 7 * 86400000)
+    .filter((item) => {
+      if (!Number.isInteger(Number(item.pid))) return true
+      try { process.kill(Number(item.pid), 0); return true } catch { return false }
+    })
+    .filter((item) => { try { loopbackBase(item.serverUrl); return true } catch { return false } })
+}
+
+async function discoverSessions() {
+  const combined = new Map()
+  for (const instance of loadInstances()) {
+    try {
+      const query = new URLSearchParams({ directory: instance.directory || "" })
+      const base = loopbackBase(instance.serverUrl)
+      const [sessions, statuses] = await Promise.all([
+        requestJson(`${base}/session?${query}`, { headers: openCodeHeaders(instance) }),
+        requestJson(`${base}/session/status?${query}`, { headers: openCodeHeaders(instance) }).catch(() => ({})),
+      ])
+      for (const info of Array.isArray(sessions) ? sessions : []) {
+        const item = {
+          id: info.id,
+          title: info.title || "未命名会话",
+          directory: info.directory || instance.directory,
+          updated: info.time?.updated || info.time?.created || 0,
+          serverUrl: base,
+          status: statuses?.[info.id]?.type || "idle",
+          summary: info.summary || null,
+          auth: instance.auth || null,
+        }
+        const previous = combined.get(item.id)
+        if (!previous || item.updated > previous.updated) combined.set(item.id, item)
+      }
+    } catch (error) {
+      log("WARN", `OpenCode instance unavailable ${instance.serverUrl}: ${error.message}`)
+    }
+  }
+  return [...combined.values()].sort((a, b) => b.updated - a.updated)
+}
+
+function latestAssistant(messages) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.info?.role !== "assistant") continue
+    const value = (messages[i].parts || []).filter((part) => part?.type === "text").map((part) => part.text || "").join("\n").trim()
+    if (value) return value
+  }
+  return "暂无助手回复"
+}
+
+async function getSessionView(session) {
+  const id = encodeURIComponent(session.id)
+  const [info, messages, todos, statuses] = await Promise.all([
+    requestSessionJson(session, `/session/${id}`),
+    requestJson(sessionUrl(session, `/session/${id}/message`) + "&limit=12", { headers: openCodeHeaders(session) }),
+    requestSessionJson(session, `/session/${id}/todo`).catch(() => []),
+    requestSessionJson(session, "/session/status").catch(() => ({})),
+  ])
+  const status = statuses?.[session.id]?.type || session.status || "idle"
+  const pending = (Array.isArray(todos) ? todos : []).filter((todo) => !["completed", "cancelled"].includes(todo.status))
+  const summary = info?.summary ? `改动 ${info.summary.files || 0} 文件，+${info.summary.additions || 0}/-${info.summary.deletions || 0}` : "暂无改动统计"
+  return compact(`【${info?.title || session.title}】\n状态：${status}\n目录：${info?.directory || session.directory}\n${summary}\n待办：${pending.length}\n\n最近回复：\n${latestAssistant(Array.isArray(messages) ? messages : [])}`)
+}
+
+async function main() {
+  ensureDirectories()
+  if (!existsSync(configPath)) throw new Error(`尚未配置：${configPath}`)
+  const config = readJson(configPath)
+  if (!config?.allowedUserId || !config?.allowedChatId || !config?.botTokenProtected) throw new Error("桥接配置不完整")
+  const botToken = decryptToken()
+  const apiBase = `https://api.telegram.org/bot${botToken}`
+  const state = readJson(statePath, { updateOffset: 0, selected: null, sessionMap: [] })
+  state.queues ||= {}
+  state.queueInFlight ||= {}
+  state.queuePaused ||= {}
+  state.queueStartOnIdle ||= {}
+  state.processedEventIds ||= []
+  state.recentEvents ||= {}
+  state.sessionBrowser ||= { mode: "sessions", query: "", page: 1 }
+  state.lastError ||= null
+  const startedAt = new Date().toISOString()
+
+  async function telegram(method, body = {}) {
+    const response = await requestJson(`${apiBase}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }, method === "getUpdates" ? 40000 : 15000)
+    if (!response?.ok) throw new Error(`Telegram ${method} 返回失败`)
+    return response.result
+  }
+
+  async function send(text, extra = {}) {
+    return telegram("sendMessage", { chat_id: String(config.allowedChatId), text: compact(text, 3900), ...extra })
+  }
+
+  function authorizedMessage(message) {
+    return message?.chat?.type === "private" && String(message.from?.id) === String(config.allowedUserId) && String(message.chat?.id) === String(config.allowedChatId)
+  }
+
+  function authorizedCallback(query) {
+    return query?.message?.chat?.type === "private"
+      && String(query.from?.id) === String(config.allowedUserId)
+      && String(query.message.chat?.id) === String(config.allowedChatId)
+  }
+
+  function saveState() { atomicJson(statePath, state) }
+
+  function recordError(scope, error) {
+    state.lastError = { scope, message: compact(error?.message || error, 500), at: new Date().toISOString() }
+    saveState()
+  }
+
+  function rememberEvent(event) {
+    const id = String(event.id || "")
+    if (id && !state.processedEventIds.includes(id)) state.processedEventIds.push(id)
+    state.processedEventIds = state.processedEventIds.slice(-500)
+    if (event.sessionId) state.recentEvents[event.sessionId] = { fingerprint: eventFingerprint(event), at: event.createdAt || new Date().toISOString() }
+    saveState()
+  }
+
+  function eventAlreadyHandled(event, activeQueueItem = null) {
+    if (event.id && state.processedEventIds.includes(String(event.id))) return true
+    if (activeQueueItem && Date.parse(event.createdAt || 0) >= Date.parse(activeQueueItem.dispatchedAt || 0)) return false
+    const recent = event.sessionId ? state.recentEvents[event.sessionId] : null
+    return Boolean(recent
+      && recent.fingerprint === eventFingerprint(event)
+      && Math.abs(Date.parse(event.createdAt || 0) - Date.parse(recent.at || 0)) < 15000)
+  }
+
+  function waitingQueue(sessionId) {
+    if (!Array.isArray(state.queues[sessionId])) state.queues[sessionId] = []
+    return state.queues[sessionId]
+  }
+
+  async function currentSessionStatus(session) {
+    try {
+      const statuses = await requestSessionJson(session, "/session/status")
+      return statuses?.[session.id]?.type || "idle"
+    } catch {
+      return "unavailable"
+    }
+  }
+
+  async function dispatchNext(session) {
+    const queue = waitingQueue(session.id)
+    if (state.queuePaused[session.id] || state.queueInFlight[session.id] || queue.length === 0) return null
+    const item = queue.shift()
+    item.dispatchedAt = new Date().toISOString()
+    item.dispatchState = "dispatching"
+    state.queueInFlight[session.id] = item
+    state.queueStartOnIdle[session.id] = false
+    saveState()
+    try {
+      await requestSessionJson(session, `/session/${encodeURIComponent(session.id)}/prompt_async`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parts: [{ type: "text", text: item.text }] }),
+      })
+      item.dispatchState = "sent"
+      item.sentAt = new Date().toISOString()
+      state.queueInFlight[session.id] = item
+      saveState()
+      log("AUDIT", `queue dispatched session=${session.id} item=${item.id} remaining=${queue.length}`)
+      return { item, remaining: queue.length }
+    } catch (error) {
+      queue.unshift(item)
+      delete state.queueInFlight[session.id]
+      saveState()
+      throw error
+    }
+  }
+
+  function queueSummary(session) {
+    const queue = waitingQueue(session.id)
+    const active = state.queueInFlight[session.id]
+    const paused = Boolean(state.queuePaused[session.id])
+    const lines = [
+      `队列状态：${paused ? "已暂停" : "自动运行"}`,
+      `当前队列任务：${active ? `${active.batchTotal > 1 ? `[${active.batchIndex}/${active.batchTotal}] ` : ""}${active.text}` : "无"}`,
+      active?.dispatchedAt ? `已运行：${durationText(active.dispatchedAt)}` : null,
+      `等待数量：${queue.length}`,
+    ].filter(Boolean)
+    queue.forEach((item, index) => lines.push(`${index + 1}. ${item.batchTotal > 1 ? `[${item.batchIndex}/${item.batchTotal}] ` : ""}${compact(item.text, 240)}`))
+    return compact(lines.join("\n"))
+  }
+
+  function makeQueueItems(parts) {
+    const batchId = randomUUID()
+    const createdAt = new Date().toISOString()
+    return parts.map((text, index) => ({
+      id: randomUUID(),
+      batchId,
+      batchIndex: index + 1,
+      batchTotal: parts.length,
+      text,
+      createdAt,
+    }))
+  }
+
+  async function healthText() {
+    const instances = loadInstances()
+    let sessions = []
+    let openCode = "离线"
+    try {
+      sessions = await discoverSessions()
+      openCode = instances.length ? "在线" : "未登记"
+    } catch (error) {
+      recordError("health", error)
+    }
+    const waiting = Object.values(state.queues).reduce((sum, list) => sum + (Array.isArray(list) ? list.length : 0), 0)
+    const running = Object.keys(state.queueInFlight).length
+    const paused = Object.values(state.queuePaused).filter(Boolean).length
+    const lastError = state.lastError ? `${state.lastError.at} [${state.lastError.scope}] ${state.lastError.message}` : "无"
+    return compact(`桥接健康状态\n\nTelegram：已连接\nOpenCode Desktop：${openCode}\n插件实例：${instances.length}\n可用会话：${sessions.length}\n当前会话：${state.selected?.title || "未选择"}\n队列：运行 ${running}，等待 ${waiting}，暂停 ${paused}\n本次运行：${durationText(startedAt)}\n最近错误：${lastError}`)
+  }
+
+  async function selectSession(session) {
+    state.selected = { id: session.id, title: session.title, directory: session.directory, serverUrl: loopbackBase(session.serverUrl), status: session.status || "idle", auth: session.auth || null }
+    saveState()
+    await send(`已选择：${session.title}\n${session.id}\n目录：${session.directory}`)
+  }
+
+  async function commandSessions(page = 1, query = "") {
+    const all = await discoverSessions()
+    const needle = String(query || "").trim().toLowerCase()
+    const filtered = needle
+      ? all.filter((item) => `${item.title}\n${item.directory}`.toLowerCase().includes(needle))
+      : all
+    const pageSize = Math.max(4, Math.min(8, Number(config.sessionPageSize || 6)))
+    const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize))
+    const currentPage = Math.max(1, Math.min(Number(page) || 1, pageCount))
+    const start = (currentPage - 1) * pageSize
+    const sessions = filtered.slice(start, start + pageSize)
+    state.sessionMap = sessions
+    state.sessionBrowser = { mode: needle ? "find" : "sessions", query: String(query || "").trim(), page: currentPage }
+    saveState()
+    if (!filtered.length) return send(needle ? `没有找到包含“${compact(query, 80)}”的会话。` : "没有发现可连接的 OpenCode 会话。请先启动一次 OpenCode；插件加载后会自动登记本机实例。")
+    const lines = sessions.map((item, index) => {
+      const selectedMark = state.selected?.id === item.id ? "✅ " : ""
+      return `${index + 1}. ${selectedMark}[${item.status}] ${item.title}\n   ${item.directory}`
+    })
+    const keyboard = sessions.map((item, index) => [{
+      text: `${state.selected?.id === item.id ? "✅ " : ""}${index + 1}. ${item.title}`.slice(0, 52),
+      callback_data: `select:${item.id}`,
+    }])
+    const nav = []
+    const prefix = needle ? "findpage" : "sessionspage"
+    if (currentPage > 1) nav.push({ text: "⬅️ 上一页", callback_data: `${prefix}:${currentPage - 1}` })
+    nav.push({ text: `${currentPage}/${pageCount}`, callback_data: "noop" })
+    if (currentPage < pageCount) nav.push({ text: "下一页 ➡️", callback_data: `${prefix}:${currentPage + 1}` })
+    keyboard.push(nav)
+    const heading = needle ? `搜索“${compact(query, 80)}”` : "OpenCode 会话"
+    await send(`${heading}（${filtered.length} 个，第 ${currentPage}/${pageCount} 页）：\n\n${lines.join("\n")}`, { reply_markup: { inline_keyboard: keyboard } })
+  }
+
+  async function resolveSelected() {
+    if (!state.selected) return null
+    loopbackBase(state.selected.serverUrl)
+    return state.selected
+  }
+
+  async function handleCommand(command) {
+    if (!command) return send("无法识别。发送 /help 查看可用命令。")
+    if (command.name === "help") return send("OpenCode Telegram Bridge\n\n/sessions 2 — 查看会话列表第 2 页\n/find 项目名 — 搜索标题或目录\n/use 1 — 选择当前页面第 1 个会话\n/current — 当前会话\n/show — 查看当前进展与最近回复\n/send 内容 — 立即发送给当前会话\n/add 内容 — 向当前会话队列追加一条指令\n/batch — 批量提交多条指令；每条之间单独一行写 ---\n/queue — 查看当前会话队列\n/remove 2 — 删除第 2 条等待任务\n/pause — 暂停自动队列\n/resume — 恢复队列\n/clearqueue — 清空等待队列\n/stop — 停止当前运行\n/health — 查看完整健康状态\n/status — 查看简要状态\n\n示例：\n/batch\n先给我内容\n---\n分析内容\n---\n写下文档")
+    if (command.name === "status") return send(`桥接在线。已登记本机 OpenCode 实例：${loadInstances().length}；当前会话：${state.selected?.title || "未选择"}`)
+    if (command.name === "health") return send(await healthText())
+    if (command.name === "sessions") return commandSessions(command.arg || 1)
+    if (command.name === "find") return commandSessions(1, command.arg)
+    if (command.name === "use") {
+      let session = null
+      const index = Number.parseInt(command.arg, 10)
+      if (Number.isInteger(index) && index > 0) session = state.sessionMap?.[index - 1] || null
+      if (!session) {
+        const sessions = await discoverSessions()
+        const matches = sessions.filter((item) => item.id === command.arg || item.id.startsWith(command.arg))
+        if (matches.length === 1) session = matches[0]
+      }
+      return session ? selectSession(session) : send("找不到该会话。请先发送 /sessions，再使用 /use 序号。")
+    }
+    const selected = await resolveSelected()
+    if (command.name === "current") return selected ? send(`当前会话：${selected.title}\n${selected.id}\n目录：${selected.directory}`) : send("尚未选择会话，请先发送 /sessions。")
+    if (!selected) return send("尚未选择会话，请先发送 /sessions。")
+    if (command.name === "show") return send(await getSessionView(selected))
+    if (command.name === "queue") return send(queueSummary(selected))
+    if (command.name === "add") {
+      const queue = waitingQueue(selected.id)
+      const limit = Number(config.queueLimit || 20)
+      const occupied = queue.length + (state.queueInFlight[selected.id] ? 1 : 0)
+      if (occupied >= limit) return send(`当前会话队列已达到上限 ${limit} 条。`)
+      const [item] = makeQueueItems([command.arg])
+      queue.push(item)
+      saveState()
+      const status = await currentSessionStatus(selected)
+      if (status === "idle" && !state.queuePaused[selected.id] && !state.queueInFlight[selected.id]) {
+        try {
+          const started = await dispatchNext(selected)
+          if (started) return send(`已追加并开始执行：\n${compact(started.item.text, 500)}\n\n完成后会通知你；剩余等待：${started.remaining}`)
+        } catch (error) {
+          return send(`指令已保存，但启动失败：${compact(error.message, 300)}\n稍后可发送 /resume 重试。`)
+        }
+      }
+      state.queueStartOnIdle[selected.id] = status !== "idle"
+      saveState()
+      return send(`已追加 1 条指令。当前会话状态：${status}；等待数量：${queue.length}`)
+    }
+    if (command.name === "batch") {
+      const queue = waitingQueue(selected.id)
+      const limit = Number(config.queueLimit || 20)
+      let parts
+      try { parts = parseBatch(command.arg, limit) } catch (error) { return send(error.message) }
+      const occupied = queue.length + (state.queueInFlight[selected.id] ? 1 : 0)
+      if (occupied + parts.length > limit) return send(`当前会话最多保留 ${limit} 条队列指令；现在还能加入 ${Math.max(0, limit - occupied)} 条。`)
+      queue.push(...makeQueueItems(parts))
+      saveState()
+      const status = await currentSessionStatus(selected)
+      if (status === "idle" && !state.queuePaused[selected.id] && !state.queueInFlight[selected.id]) {
+        try {
+          const started = await dispatchNext(selected)
+          if (started) return send(`已接收 ${parts.length} 条指令，并开始第 1 条：\n${compact(started.item.text, 500)}\n\n每条完成都会通知你；剩余等待：${started.remaining}`)
+        } catch (error) {
+          return send(`已保存 ${parts.length} 条指令，但启动失败：${compact(error.message, 300)}\n稍后可发送 /resume 重试。`)
+        }
+      }
+      state.queueStartOnIdle[selected.id] = status !== "idle"
+      saveState()
+      return send(`已接收 ${parts.length} 条指令。当前会话状态：${status}；会在会话下一次完成后依次执行。等待数量：${queue.length}`)
+    }
+    if (command.name === "remove") {
+      const queue = waitingQueue(selected.id)
+      const index = command.arg - 1
+      if (index < 0 || index >= queue.length) return send("没有这个队列序号。发送 /queue 查看等待列表。")
+      const [removed] = queue.splice(index, 1)
+      saveState()
+      return send(`已删除等待任务：\n${compact(removed.text, 500)}`)
+    }
+    if (command.name === "pause") {
+      state.queuePaused[selected.id] = true
+      saveState()
+      return send("自动队列已暂停。当前正在运行的任务不会被停止。")
+    }
+    if (command.name === "resume") {
+      state.queuePaused[selected.id] = false
+      saveState()
+      const status = await currentSessionStatus(selected)
+      if (status === "idle" && !state.queueInFlight[selected.id]) {
+        try {
+          const started = await dispatchNext(selected)
+          if (started) return send(`队列已恢复并开始下一条：\n${compact(started.item.text, 500)}\n\n剩余等待：${started.remaining}`)
+        } catch (error) {
+          return send(`队列已恢复，但启动失败：${compact(error.message, 300)}`)
+        }
+      }
+      state.queueStartOnIdle[selected.id] = status !== "idle" && waitingQueue(selected.id).length > 0
+      saveState()
+      return send(`自动队列已恢复。当前会话状态：${status}。`)
+    }
+    if (command.name === "clearqueue") {
+      const count = waitingQueue(selected.id).length
+      if (!count) return send("等待队列已经是空的。")
+      return send(`确认清空 ${count} 条等待任务？当前正在运行的任务不会被停止。`, { reply_markup: { inline_keyboard: [[{ text: "确认清空", callback_data: `clearq:${selected.id}` }, { text: "取消", callback_data: "cancel" }]] } })
+    }
+    if (command.name === "send") {
+      const id = encodeURIComponent(selected.id)
+      await requestSessionJson(selected, `/session/${id}/prompt_async`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parts: [{ type: "text", text: command.arg }] }),
+      })
+      return send("已发送给当前 OpenCode 会话。完成后会自动通知你。")
+    }
+    if (command.name === "stop") {
+      return send(`确认停止“${selected.title}”当前正在执行的任务？`, { reply_markup: { inline_keyboard: [[{ text: "确认停止", callback_data: `abort:${selected.id}` }, { text: "取消", callback_data: "cancel" }]] } })
+    }
+  }
+
+  async function handleCallback(query) {
+    if (!authorizedCallback(query)) {
+      log("AUDIT", `ignored unauthorized callback user=${query?.from?.id || "unknown"}`)
+      return
+    }
+    const data = String(query.data || "")
+    log("AUDIT", `callback user=${query.from.id} data=${data}`)
+    try {
+      if (data === "noop") await telegram("answerCallbackQuery", { callback_query_id: query.id })
+      else if (data === "cancel") await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已取消" })
+      else if (data.startsWith("sessionspage:")) {
+        await telegram("answerCallbackQuery", { callback_query_id: query.id })
+        await commandSessions(Number.parseInt(data.slice(13), 10) || 1)
+      } else if (data.startsWith("findpage:")) {
+        await telegram("answerCallbackQuery", { callback_query_id: query.id })
+        await commandSessions(Number.parseInt(data.slice(9), 10) || 1, state.sessionBrowser?.query || "")
+      }
+      else if (data.startsWith("select:")) {
+        const id = data.slice(7)
+        const session = (await discoverSessions()).find((item) => item.id === id)
+        if (!session) throw new Error("会话已不可用")
+        await selectSession(session)
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已设为当前会话" })
+      } else if (data.startsWith("show:")) {
+        const id = data.slice(5)
+        const session = (await discoverSessions()).find((item) => item.id === id)
+        if (!session) throw new Error("会话已不可用")
+        await send(await getSessionView(session))
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已发送详情" })
+      } else if (data.startsWith("addhelp:")) {
+        const id = data.slice(8)
+        const session = (await discoverSessions()).find((item) => item.id === id)
+        if (!session) throw new Error("会话已不可用")
+        state.selected = { id: session.id, title: session.title, directory: session.directory, serverUrl: loopbackBase(session.serverUrl), status: session.status || "idle", auth: session.auth || null }
+        saveState()
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已设为当前会话" })
+        await send(`已选择“${session.title}”。\n\n追加一条：/add 指令内容\n批量提交：/batch 后按 --- 分隔。`)
+      } else if (data.startsWith("queue:")) {
+        const id = data.slice(6)
+        const session = (await discoverSessions()).find((item) => item.id === id)
+        if (!session) throw new Error("会话已不可用")
+        await send(queueSummary(session))
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已发送队列" })
+      } else if (data.startsWith("stopask:")) {
+        const id = data.slice(8)
+        const session = (await discoverSessions()).find((item) => item.id === id)
+        if (!session) throw new Error("会话已不可用")
+        await telegram("answerCallbackQuery", { callback_query_id: query.id })
+        await send(`确认停止“${session.title}”当前任务？`, { reply_markup: { inline_keyboard: [[{ text: "确认停止", callback_data: `abort:${session.id}` }, { text: "取消", callback_data: "cancel" }]] } })
+      } else if (data.startsWith("abort:")) {
+        const id = data.slice(6)
+        const selected = (await discoverSessions()).find((item) => item.id === id)
+        if (!selected) throw new Error("会话已不可用")
+        state.queuePaused[id] = true
+        state.queueStartOnIdle[id] = false
+        saveState()
+        await requestSessionJson(selected, `/session/${encodeURIComponent(id)}/abort`, { method: "POST" })
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已请求停止" })
+        await send("已向 OpenCode 发出停止请求，自动队列也已暂停。")
+      } else if (data.startsWith("clearq:")) {
+        const id = data.slice(7)
+        const selected = await resolveSelected()
+        if (!selected || selected.id !== id) throw new Error("当前会话已改变")
+        state.queues[id] = []
+        saveState()
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "等待队列已清空" })
+        await send("等待队列已清空。当前正在运行的任务未受影响。")
+      }
+    } catch (error) {
+      await telegram("answerCallbackQuery", { callback_query_id: query.id, text: compact(error.message, 120), show_alert: true }).catch(() => {})
+    }
+  }
+
+  async function processUpdate(update) {
+    if (update.callback_query) return handleCallback(update.callback_query)
+    const message = update.message
+    if (!authorizedMessage(message) || typeof message.text !== "string") {
+      if (message) log("AUDIT", `拒绝 Telegram 消息 user=${message.from?.id} chat=${message.chat?.id} type=${message.chat?.type}`)
+      return
+    }
+    log("AUDIT", `command user=${message.from.id} text=${message.text.slice(0, 80)}`)
+    await handleCommand(parseCommand(message.text))
+  }
+
+  async function telegramLoop() {
+    while (true) {
+      try {
+        const updates = await telegram("getUpdates", { offset: Number(state.updateOffset || 0), timeout: 30, allowed_updates: ["message", "callback_query"] })
+        for (const update of updates || []) {
+          try { await processUpdate(update) } catch (error) { recordError("telegram-command", error); log("ERROR", `处理 Telegram 更新失败：${error.stack || error.message}`); await send(`操作失败：${compact(error.message, 500)}`).catch(() => {}) }
+          state.updateOffset = Number(update.update_id) + 1
+          saveState()
+        }
+      } catch (error) {
+        recordError("telegram-polling", error)
+        log("WARN", `Telegram 轮询失败：${error.message}`)
+        await sleep(5000)
+      }
+    }
+  }
+
+  function completionButtons(event) {
+    if (!event.sessionId) return {}
+    const current = state.selected?.id === event.sessionId
+    return { reply_markup: { inline_keyboard: [
+      [{ text: current ? "✅ 当前会话" : "设为当前", callback_data: `select:${event.sessionId}` }, { text: "查看详情", callback_data: `show:${event.sessionId}` }],
+      [{ text: "➕ 追加指令", callback_data: `addhelp:${event.sessionId}` }, { text: "📋 查看队列", callback_data: `queue:${event.sessionId}` }],
+      [{ text: "⏹ 停止任务", callback_data: `stopask:${event.sessionId}` }],
+    ] } }
+  }
+
+  function pendingCompletionExists(sessionId, dispatchedAt) {
+    return readdirSync(eventsDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .some((entry) => {
+        const event = readJson(join(eventsDir, entry.name))
+        return event?.sessionId === sessionId && Date.parse(event.createdAt || 0) >= Date.parse(dispatchedAt || 0)
+      })
+  }
+
+  async function recentSessionMessages(session, limit = 30) {
+    return requestJson(sessionUrl(session, `/session/${encodeURIComponent(session.id)}/message`) + `&limit=${limit}`, { headers: openCodeHeaders(session) })
+  }
+
+  function messageTimestamp(message) {
+    let value = Number(message?.info?.time?.completed || message?.info?.time?.updated || message?.info?.time?.created || 0)
+    if (value > 0 && value < 1e12) value *= 1000
+    return value
+  }
+
+  function messageText(message) {
+    return (message?.parts || []).filter((part) => part?.type === "text").map((part) => part.text || "").join("\n").trim()
+  }
+
+  async function synthesizeRecoveredCompletion(session, item) {
+    const messages = await recentSessionMessages(session)
+    const sentAt = Date.parse(item.dispatchedAt || item.createdAt || 0)
+    const prompt = messages.filter((message) => message?.info?.role === "user"
+      && messageTimestamp(message) >= sentAt - 5000
+      && messageText(message) === String(item.text || "").trim())
+      .sort((a, b) => messageTimestamp(b) - messageTimestamp(a))[0]
+    if (!prompt) return false
+    const promptAt = messageTimestamp(prompt)
+    const assistant = messages.filter((message) => message?.info?.role === "assistant" && messageTimestamp(message) >= promptAt)
+      .sort((a, b) => messageTimestamp(b) - messageTimestamp(a))[0]
+    const payload = {
+      version: 1,
+      id: `recovered-${randomUUID()}`,
+      type: "session.idle",
+      createdAt: new Date().toISOString(),
+      sessionId: session.id,
+      title: session.title,
+      directory: session.directory,
+      serverUrl: session.serverUrl,
+      summary: session.summary || null,
+      excerpt: assistant ? messageText(assistant).slice(0, 1800) : "",
+      recovered: true,
+    }
+    atomicJson(join(eventsDir, `${Date.now()}-${payload.id}.json`), payload)
+    return true
+  }
+
+  async function reconcileQueues() {
+    const activeEntries = Object.entries(state.queueInFlight)
+    if (!activeEntries.length) return
+    const sessions = await discoverSessions()
+    const byId = new Map(sessions.map((session) => [session.id, session]))
+    for (const [sessionId, item] of activeEntries) {
+      const session = byId.get(sessionId)
+      if (!session) continue
+      const status = await currentSessionStatus(session)
+      if (status !== "idle") continue
+      if (pendingCompletionExists(sessionId, item.dispatchedAt)) continue
+      try {
+        if (await synthesizeRecoveredCompletion(session, item)) {
+          log("INFO", `recovered completed queue item session=${sessionId} item=${item.id}`)
+          continue
+        }
+        waitingQueue(sessionId).unshift(item)
+        delete state.queueInFlight[sessionId]
+        saveState()
+        if (!state.queuePaused[sessionId]) await dispatchNext(session)
+      } catch (error) {
+        recordError("queue-recovery", error)
+        log("WARN", `queue recovery failed session=${sessionId}: ${error.message}`)
+      }
+    }
+  }
+
+  async function recoveryLoop() {
+    await sleep(10000)
+    while (true) {
+      try { await reconcileQueues() } catch (error) { recordError("queue-recovery", error) }
+      await sleep(60000)
+    }
+  }
+
+  async function eventLoop() {
+    while (true) {
+      const files = readdirSync(eventsDir, { withFileTypes: true }).filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => entry.name).sort().slice(0, 20)
+      for (const name of files) {
+        const path = join(eventsDir, name)
+        const event = readJson(path)
+        if (!event) { rmSync(path, { force: true }); continue }
+        if (event.nextAttemptAt && Date.parse(event.nextAttemptAt) > Date.now()) continue
+        if (Date.now() - Date.parse(event.createdAt || 0) > 7 * 86400000) { rmSync(path, { force: true }); continue }
+        const activeQueueItem = event.sessionId ? state.queueInFlight[event.sessionId] : null
+        const matchesQueue = Boolean(activeQueueItem && Date.parse(event.createdAt || 0) >= Date.parse(activeQueueItem.dispatchedAt || 0))
+        if (eventAlreadyHandled(event, matchesQueue ? activeQueueItem : null)) {
+          rmSync(path, { force: true })
+          log("INFO", `duplicate completion ignored event=${event.id || name} session=${event.sessionId || "none"}`)
+          continue
+        }
+        const waiting = event.sessionId ? waitingQueue(event.sessionId).length : 0
+        const isError = event.type === "session.error"
+        let queueNote = "\n来源：电脑端手动任务"
+        if (matchesQueue) {
+          const progress = activeQueueItem.batchTotal > 1 ? `第 ${activeQueueItem.batchIndex}/${activeQueueItem.batchTotal} 条` : "队列指令"
+          const next = waitingQueue(event.sessionId)[0]
+          queueNote = `\n队列：${progress}${isError ? "执行失败" : "已完成"}\n耗时：${durationText(activeQueueItem.dispatchedAt, Date.parse(event.createdAt || Date.now()))}\n剩余：${waiting} 条${next ? `\n下一条：${compact(next.text, 180)}` : ""}`
+          if (isError) queueNote += "\n队列已自动暂停。"
+        } else if (event.sessionId && state.queueStartOnIdle[event.sessionId] && waiting) {
+          queueNote += `\n已有 ${waiting} 条新队列指令，将在通知后开始。`
+        }
+        const icon = isError ? "❌" : "✅"
+        const stats = event.summary ? `\n改动：${event.summary.files || 0} 文件，+${event.summary.additions || 0}/-${event.summary.deletions || 0}` : ""
+        const detail = isError ? `\n错误：${event.error || "未知错误"}` : event.excerpt ? `\n\n最近回复：\n${event.excerpt}` : ""
+        const text = compact(`${icon} OpenCode ${isError ? "执行失败" : "任务已完成"}\n${event.title}\n目录：${event.directory}${stats}${queueNote}${detail}`)
+        try {
+          await send(text, completionButtons(event))
+          if (matchesQueue) {
+            delete state.queueInFlight[event.sessionId]
+            if (isError) {
+              state.queuePaused[event.sessionId] = true
+              state.queueStartOnIdle[event.sessionId] = false
+            }
+          }
+          rememberEvent(event)
+          rmSync(path, { force: true })
+          const shouldStart = event.sessionId && event.type === "session.idle" && waiting && !state.queuePaused[event.sessionId]
+            && (matchesQueue || state.queueStartOnIdle[event.sessionId])
+          if (shouldStart) {
+            state.queueStartOnIdle[event.sessionId] = false
+            saveState()
+            try {
+              await dispatchNext({ id: event.sessionId, title: event.title, directory: event.directory, serverUrl: event.serverUrl })
+            } catch (error) {
+              recordError("queue-dispatch", error)
+              await send(`队列下一条启动失败，指令已保留：${compact(error.message, 300)}\n请发送 /resume 重试。`).catch(() => {})
+            }
+          } else if (matchesQueue && !isError && waiting === 0) {
+            await send(`🎉 “${event.title}”的队列已全部完成。`)
+          }
+        } catch (error) {
+          event.attempts = Number(event.attempts || 0) + 1
+          event.nextAttemptAt = new Date(Date.now() + Math.min(300000, 5000 * (2 ** Math.min(event.attempts, 6)))).toISOString()
+          atomicJson(path, event)
+          recordError("notification", error)
+          log("WARN", `通知发送失败 ${name}: ${error.message}`)
+        }
+      }
+      await sleep(1500)
+    }
+  }
+
+  const me = await telegram("getMe")
+  await telegram("setMyCommands", { commands: [
+    { command: "sessions", description: "列出最近的 OpenCode 会话" },
+    { command: "find", description: "按标题或项目目录搜索会话" },
+    { command: "current", description: "查看当前选择的会话" },
+    { command: "show", description: "查看当前会话进展" },
+    { command: "send", description: "向当前会话发送一条指令" },
+    { command: "add", description: "向当前会话队列追加一条指令" },
+    { command: "batch", description: "按 --- 分隔并依次执行多条指令" },
+    { command: "queue", description: "查看当前会话的指令队列" },
+    { command: "pause", description: "暂停当前会话的自动队列" },
+    { command: "resume", description: "恢复当前会话的自动队列" },
+    { command: "clearqueue", description: "清空等待中的队列指令" },
+    { command: "stop", description: "停止当前会话的运行" },
+    { command: "status", description: "查看桥接状态" },
+    { command: "health", description: "查看完整健康状态" },
+    { command: "help", description: "显示帮助" },
+  ] }).catch((error) => log("WARN", `更新 Telegram 命令菜单失败: ${error.message}`))
+  log("INFO", `bridge started bot=@${me.username}`)
+  await send("OpenCode Telegram Bridge 已上线。发送 /sessions 查看会话。")
+  await Promise.all([telegramLoop(), eventLoop(), recoveryLoop()])
+}
+
+async function check() {
+  ensureDirectories()
+  const config = readJson(configPath)
+  if (!config) throw new Error("NOT_CONFIGURED")
+  const token = decryptToken()
+  const result = await requestJson(`https://api.telegram.org/bot${token}/getMe`)
+  if (!result?.ok) throw new Error("Telegram getMe 失败")
+  const commandResult = await requestJson(`https://api.telegram.org/bot${token}/getMyCommands`)
+  const commandNames = new Set((commandResult?.result || []).map((item) => item.command))
+  if (!["add", "batch", "find", "health"].every((name) => commandNames.has(name))) throw new Error("Telegram 命令菜单不完整")
+  const sessions = await discoverSessions()
+  console.log(`CHECK=PASS BOT=@${result.result.username} INSTANCES=${loadInstances().length} SESSIONS=${sessions.length} COMMANDS=add,batch,find,health`)
+}
+
+function selfTest() {
+  if (parseCommand("/sessions").name !== "sessions") throw new Error("parse sessions failed")
+  if (parseCommand("/sessions 2").arg !== 2) throw new Error("parse sessions page failed")
+  if (parseCommand("/find paper project").arg !== "paper project") throw new Error("parse find failed")
+  if (parseCommand("/health").name !== "health") throw new Error("parse health failed")
+  if (parseCommand("/send 继续运行测试").arg !== "继续运行测试") throw new Error("parse send failed")
+  if (parseCommand("/add 先运行测试").name !== "add") throw new Error("parse add failed")
+  if (parseCommand("/batch 先运行测试\n---\n再写文档").name !== "batch") throw new Error("parse batch failed")
+  if (parseBatch("先运行测试\n---\n再写文档").length !== 2) throw new Error("split batch failed")
+  if (eventFingerprint({ type: "session.idle", sessionId: "s", excerpt: "ok" }) !== eventFingerprint({ id: "other", type: "session.idle", sessionId: "s", excerpt: "ok" })) throw new Error("event fingerprint unstable")
+  if (eventFingerprint({ type: "session.idle", sessionId: "s", excerpt: "ok" }) === eventFingerprint({ type: "session.idle", sessionId: "s", excerpt: "different" })) throw new Error("event fingerprint collision")
+  if (parseCommand("/remove 2").arg !== 2) throw new Error("parse remove failed")
+  if (parseCommand("hello") !== null) throw new Error("free text must not execute")
+  if (loopbackBase("http://127.0.0.1:4096/path") !== "http://127.0.0.1:4096") throw new Error("loopback normalize failed")
+  let rejected = false
+  try { loopbackBase("https://example.com") } catch { rejected = true }
+  if (!rejected) throw new Error("remote server must be rejected")
+  console.log("SELF_TEST=PASS")
+}
+
+const mode = process.argv[2] || "run"
+if (mode === "--self-test") selfTest()
+else if (mode === "--check") await check()
+else {
+  ensureDirectories()
+  try {
+    acquireLock()
+    const cleanup = () => { releaseLock(); process.exit(0) }
+    process.on("SIGINT", cleanup)
+    process.on("SIGTERM", cleanup)
+    await main()
+  } catch (error) {
+    log("FATAL", error.stack || error.message)
+    console.error(redact(error.message))
+    releaseLock()
+    process.exitCode = 1
+  }
+}
