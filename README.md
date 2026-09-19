@@ -1,5 +1,7 @@
 # OpenCode Telegram Bridge
 
+[![CI](https://github.com/smallSheep123/opencode-telegram-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/smallSheep123/opencode-telegram-bridge/actions/workflows/ci.yml)
+
 [简体中文](docs/README.zh-CN.md) · [Architecture](docs/ARCHITECTURE.md) · [Security](SECURITY.md)
 
 A local, Windows-first bridge between OpenCode Desktop and Telegram. It sends completion notifications for every OpenCode session and lets one authorized Telegram account browse sessions, inspect progress, send prompts, and run sequential prompt queues.

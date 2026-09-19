@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check JavaScript syntax
+        run: npm run check
+
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $errors = @()
+          Get-ChildItem -Recurse -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors) { $errors += $parseErrors }
+          }
+          if ($errors.Count) {
+            $errors | Format-List
+            exit 1
+          }
