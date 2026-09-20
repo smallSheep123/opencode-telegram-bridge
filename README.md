@@ -14,6 +14,7 @@ A local, Windows-first bridge between OpenCode Desktop and Telegram. It sends co
 - Queue recovery after bridge or OpenCode restarts.
 - Duplicate completion suppression and queue-safe event correlation.
 - Queue progress notifications with position, duration, remaining work, and next prompt.
+- Telegram approval buttons when OpenCode pauses for a permission decision.
 - One-user private-chat authorization using Telegram user and chat IDs.
 - Windows DPAPI protection for the Telegram token and OpenCode's temporary local credential.
 - Loopback-only OpenCode access. The bridge opens no inbound port.
@@ -66,6 +67,7 @@ The scheduled-task launcher imports an enabled Windows/WinINET HTTP proxy before
 | `/resume` | Resume automatic queue progression |
 | `/clearqueue` | Clear waiting items after confirmation |
 | `/stop` | Stop the active session task after confirmation |
+| `/approvals` | Show pending OpenCode permission requests again |
 | `/health` | Show Telegram, OpenCode, plugin, session, queue, and error health |
 | `/status` | Show a compact bridge status |
 | `/help` | Show command help |
@@ -82,6 +84,8 @@ Write a short maintenance note
 ```
 
 Each prompt starts only after the previous prompt reaches a completion event. The bot sends a completion message before starting the next item and sends a separate message when the queue is empty.
+
+When OpenCode waits for permission, the bridge shows the permission type, affected patterns, project directory, and buttons for **Allow once**, **Always allow matching operations**, and **Reject**. The controller calls only OpenCode's loopback permission API. Pending requests are rediscovered after a bridge restart, and `/approvals` can show them again on demand.
 
 ## Management
 
@@ -107,7 +111,7 @@ npm test
 npm run check
 ```
 
-`npm test` validates command parsing, batch splitting, event fingerprints, loopback restrictions, DPAPI credential protection, plugin registration, and completion event creation.
+`npm test` validates command parsing, batch splitting, approval callback tokens, event fingerprints, loopback restrictions, DPAPI credential protection, plugin registration, and completion event creation.
 
 ## Security model
 

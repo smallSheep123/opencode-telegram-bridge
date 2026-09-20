@@ -1,6 +1,6 @@
 {
   "name": "opencode-telegram-bridge",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "Secure local bridge for OpenCode Desktop completion notifications and Telegram session control.",
   "type": "module",

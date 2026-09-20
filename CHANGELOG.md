@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.2.0 - 2026-09-20
+
+### Added
+
+- Detect pending OpenCode permission requests and deliver Telegram approval buttons for `once`, `always`, and `reject`.
+- Persist short callback-token mappings so pending approvals survive bridge restarts without exposing request details in Telegram callback data.
+- Add `/approvals` and include the pending approval count in `/health`.
+- Fall back to the legacy session permission endpoint when required by an older OpenCode build.
+
+### Fixed
+
+- Stop orphaned controller child processes during service restarts so only one Telegram long poll remains active.
+
 ## 0.1.1 - 2026-09-19
 
 ### Fixed

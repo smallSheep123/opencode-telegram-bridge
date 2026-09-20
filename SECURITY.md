@@ -18,6 +18,7 @@ Include the affected commit, Windows version, OpenCode Desktop version, reproduc
 - It does not listen for inbound network traffic.
 - Telegram Bot tokens and OpenCode Desktop temporary credentials are protected with Windows DPAPI for the current user.
 - Runtime files are restricted to the current user, SYSTEM, and local administrators during setup.
+- Permission callback data contains only a short local mapping token and the selected reply; the controller rechecks the bound Telegram identity before calling OpenCode.
 - Anyone who can act as the configured Windows user or local administrator is inside the local trust boundary.
 
 ## Operational guidance

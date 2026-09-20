@@ -134,6 +134,7 @@ export function parseCommand(text) {
   if (/^\/clearqueue(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "clearqueue" }
   if (/^\/stop(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "stop" }
   if (/^\/health(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "health" }
+  if (/^\/approvals(?:@[A-Za-z0-9_]+)?$/i.test(value)) return { name: "approvals" }
   return null
 }
 
@@ -148,6 +149,32 @@ export function parseBatch(value, limit = 20) {
 function compact(text, max = 3600) {
   const value = String(text || "").replace(/\0/g, "").trim()
   return value.length > max ? `${value.slice(0, max)}\n…（已截断）` : value
+}
+
+export function permissionToken(serverUrl, requestId) {
+  return createHash("sha256").update(`${loopbackBase(serverUrl)}\n${String(requestId)}`).digest("hex").slice(0, 16)
+}
+
+function permissionActionText(reply) {
+  return ({ once: "仅允许这次", always: "持续允许同类操作", reject: "拒绝" })[reply] || String(reply)
+}
+
+function permissionDetails(request) {
+  const patterns = Array.isArray(request.patterns) ? request.patterns : request.pattern ? [request.pattern] : []
+  const metadata = request.metadata && typeof request.metadata === "object" ? request.metadata : {}
+  const usefulMetadata = Object.entries(metadata)
+    .filter(([, value]) => ["string", "number", "boolean"].includes(typeof value) && String(value).trim())
+    .slice(0, 6)
+    .map(([key, value]) => `${key}：${compact(value, 500)}`)
+  return compact([
+    `🔐 OpenCode 请求审批`,
+    `会话：${request.title || request.sessionId || "未知会话"}`,
+    `权限：${request.permission || request.type || "未知"}`,
+    patterns.length ? `目标：\n${patterns.slice(0, 10).map((item) => `• ${compact(item, 600)}`).join("\n")}` : null,
+    usefulMetadata.length ? `详情：\n${usefulMetadata.join("\n")}` : null,
+    request.directory ? `目录：${request.directory}` : null,
+    "请选择处理方式。任务会在你决定后继续。",
+  ].filter(Boolean).join("\n\n"), 3900)
 }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }
@@ -300,6 +327,7 @@ async function main() {
     { command: "stop", description: "停止当前会话的运行" },
     { command: "status", description: "查看桥接状态" },
     { command: "health", description: "查看完整健康状态" },
+    { command: "approvals", description: "查看等待处理的 OpenCode 审批" },
     { command: "help", description: "显示帮助" },
   ]
   const state = readJson(statePath, { updateOffset: 0, selected: null, sessionMap: [] })
@@ -310,6 +338,7 @@ async function main() {
   state.processedEventIds ||= []
   state.recentEvents ||= {}
   state.sessionBrowser ||= { mode: "sessions", query: "", page: 1 }
+  state.permissionRequests ||= {}
   state.lastError ||= null
   const startedAt = new Date().toISOString()
   let telegramReady = false
@@ -327,6 +356,171 @@ async function main() {
 
   async function send(text, extra = {}) {
     return telegram("sendMessage", { chat_id: String(config.allowedChatId), text: compact(text, 3900), ...extra })
+  }
+
+  function permissionKeyboard(token) {
+    return { inline_keyboard: [
+      [{ text: "✅ 仅允许这次", callback_data: `perm:${token}:once` }],
+      [{ text: "🔁 持续允许同类操作", callback_data: `perm:${token}:always` }],
+      [{ text: "⛔ 拒绝", callback_data: `perm:${token}:reject` }],
+    ] }
+  }
+
+  async function sendPermissionRequest(token, request, repeat = false) {
+    const message = await send(permissionDetails(request), { reply_markup: permissionKeyboard(token) })
+    if (!repeat || !request.notifiedAt) {
+      request.notifiedAt = new Date().toISOString()
+      request.messageId = message?.message_id || null
+      saveState()
+    }
+    return message
+  }
+
+  async function permissionTitle(request) {
+    if (state.selected?.id === request.sessionId) return state.selected.title
+    const cached = (state.sessionMap || []).find((item) => item.id === request.sessionId)
+    if (cached?.title) return cached.title
+    if (!request.sessionId) return "OpenCode 会话"
+    try {
+      const info = await requestSessionJson(request, `/session/${encodeURIComponent(request.sessionId)}`)
+      return info?.title || request.sessionId
+    } catch {
+      return request.sessionId
+    }
+  }
+
+  async function discoverPendingPermissions() {
+    const found = new Map()
+    const checkedScopes = new Set()
+    const unique = new Map()
+    for (const instance of loadInstances()) {
+      const base = loopbackBase(instance.serverUrl)
+      const scope = `${base}\n${String(instance.directory || "")}`
+      if (!unique.has(scope)) unique.set(scope, instance)
+    }
+    for (const instance of unique.values()) {
+      const base = loopbackBase(instance.serverUrl)
+      const directory = String(instance.directory || "")
+      const scope = `${base}\n${directory}`
+      try {
+        const query = new URLSearchParams({ directory })
+        const list = await requestJson(`${base}/permission?${query}`, { headers: openCodeHeaders(instance) }, 5000)
+        checkedScopes.add(scope)
+        for (const raw of Array.isArray(list) ? list : []) {
+          if (!raw?.id) continue
+          const token = permissionToken(base, raw.id)
+          const previous = found.get(token)
+          if (previous) {
+            if (!previous.candidateDirectories.includes(directory)) previous.candidateDirectories.push(directory)
+            continue
+          }
+          const request = {
+            requestId: String(raw.id),
+            sessionId: raw.sessionID ? String(raw.sessionID) : null,
+            permission: String(raw.permission || raw.type || "unknown"),
+            patterns: Array.isArray(raw.patterns) ? raw.patterns.map(String) : raw.pattern ? [String(raw.pattern)] : [],
+            always: Array.isArray(raw.always) ? raw.always.map(String) : [],
+            metadata: raw.metadata && typeof raw.metadata === "object" ? raw.metadata : {},
+            serverUrl: base,
+            directory,
+            candidateDirectories: [directory],
+            firstSeenAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+          }
+          request.title = await permissionTitle(request)
+          found.set(token, request)
+        }
+      } catch (error) {
+        log("WARN", `permission scan unavailable ${base}: ${error.message}`)
+      }
+    }
+    return { found, checkedScopes }
+  }
+
+  async function refreshPermissions() {
+    const { found, checkedScopes } = await discoverPendingPermissions()
+    const now = new Date().toISOString()
+    let changed = false
+    for (const [token, current] of found) {
+      const existing = state.permissionRequests[token]
+      if (existing?.resolvedAt) continue
+      if (existing) {
+        Object.assign(existing, current, {
+          firstSeenAt: existing.firstSeenAt || current.firstSeenAt,
+          lastSeenAt: existing.lastSeenAt || current.lastSeenAt,
+          notifiedAt: existing.notifiedAt || null,
+          messageId: existing.messageId || null,
+        })
+        if (existing.absentSince) {
+          delete existing.absentSince
+          changed = true
+        }
+      } else {
+        state.permissionRequests[token] = current
+        changed = true
+      }
+      if (Date.now() - Date.parse(state.permissionRequests[token].lastSeenAt || 0) >= 60000) {
+        state.permissionRequests[token].lastSeenAt = now
+        changed = true
+      }
+      if (!state.permissionRequests[token].notifiedAt) await sendPermissionRequest(token, state.permissionRequests[token])
+    }
+    for (const [token, request] of Object.entries(state.permissionRequests)) {
+      if (request.resolvedAt || found.has(token)) continue
+      const scopes = (request.candidateDirectories || [request.directory || ""]).map((directory) => `${loopbackBase(request.serverUrl)}\n${directory}`)
+      if (!scopes.some((scope) => checkedScopes.has(scope))) continue
+      if (!request.absentSince) {
+        request.absentSince = now
+        changed = true
+      }
+      if (Date.now() - Date.parse(request.absentSince) >= 30000) {
+        request.resolvedAt = now
+        request.resolution = "external"
+        changed = true
+      }
+    }
+    const cutoff = Date.now() - 7 * 86400000
+    for (const [token, request] of Object.entries(state.permissionRequests)) {
+      if (request.resolvedAt && Date.parse(request.resolvedAt) < cutoff) {
+        delete state.permissionRequests[token]
+        changed = true
+      }
+    }
+    if (changed) saveState()
+    return found
+  }
+
+  async function replyToPermission(request, reply) {
+    const directories = [...new Set(request.candidateDirectories || [request.directory || ""])]
+    let lastError = null
+    for (const directory of directories) {
+      const target = { serverUrl: request.serverUrl, directory }
+      try {
+        await requestSessionJson(target, `/permission/${encodeURIComponent(request.requestId)}/reply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reply }),
+        })
+        return
+      } catch (error) {
+        lastError = error
+        if (!/HTTP 404\b/.test(error.message)) throw error
+      }
+      if (request.sessionId) {
+        try {
+          await requestSessionJson(target, `/session/${encodeURIComponent(request.sessionId)}/permissions/${encodeURIComponent(request.requestId)}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ response: reply }),
+          })
+          return
+        } catch (error) {
+          lastError = error
+          if (!/HTTP 404\b/.test(error.message)) throw error
+        }
+      }
+    }
+    throw lastError || new Error("审批已失效或 OpenCode 会话已关闭")
   }
 
   function authorizedMessage(message) {
@@ -447,7 +641,8 @@ async function main() {
     const running = Object.keys(state.queueInFlight).length
     const paused = Object.values(state.queuePaused).filter(Boolean).length
     const lastError = state.lastError ? `${state.lastError.at} [${state.lastError.scope}] ${state.lastError.message}` : "无"
-    return compact(`桥接健康状态\n\nTelegram：已连接\nOpenCode Desktop：${openCode}\n插件实例：${instances.length}\n可用会话：${sessions.length}\n当前会话：${state.selected?.title || "未选择"}\n队列：运行 ${running}，等待 ${waiting}，暂停 ${paused}\n本次运行：${durationText(startedAt)}\n最近错误：${lastError}`)
+    const approvals = Object.values(state.permissionRequests).filter((item) => !item.resolvedAt).length
+    return compact(`桥接健康状态\n\nTelegram：已连接\nOpenCode Desktop：${openCode}\n插件实例：${instances.length}\n可用会话：${sessions.length}\n当前会话：${state.selected?.title || "未选择"}\n待审批：${approvals}\n队列：运行 ${running}，等待 ${waiting}，暂停 ${paused}\n本次运行：${durationText(startedAt)}\n最近错误：${lastError}`)
   }
 
   async function selectSession(session) {
@@ -497,9 +692,16 @@ async function main() {
 
   async function handleCommand(command) {
     if (!command) return send("无法识别。发送 /help 查看可用命令。")
-    if (command.name === "help") return send("OpenCode Telegram Bridge\n\n/sessions 2 — 查看会话列表第 2 页\n/find 项目名 — 搜索标题或目录\n/use 1 — 选择当前页面第 1 个会话\n/current — 当前会话\n/show — 查看当前进展与最近回复\n/send 内容 — 立即发送给当前会话\n/add 内容 — 向当前会话队列追加一条指令\n/batch — 批量提交多条指令；每条之间单独一行写 ---\n/queue — 查看当前会话队列\n/remove 2 — 删除第 2 条等待任务\n/pause — 暂停自动队列\n/resume — 恢复队列\n/clearqueue — 清空等待队列\n/stop — 停止当前运行\n/health — 查看完整健康状态\n/status — 查看简要状态\n\n示例：\n/batch\n先给我内容\n---\n分析内容\n---\n写下文档")
+    if (command.name === "help") return send("OpenCode Telegram Bridge\n\n/sessions 2 — 查看会话列表第 2 页\n/find 项目名 — 搜索标题或目录\n/use 1 — 选择当前页面第 1 个会话\n/current — 当前会话\n/show — 查看当前进展与最近回复\n/send 内容 — 立即发送给当前会话\n/add 内容 — 向当前会话队列追加一条指令\n/batch — 批量提交多条指令；每条之间单独一行写 ---\n/queue — 查看当前会话队列\n/remove 2 — 删除第 2 条等待任务\n/pause — 暂停自动队列\n/resume — 恢复队列\n/clearqueue — 清空等待队列\n/stop — 停止当前运行\n/approvals — 查看等待处理的审批\n/health — 查看完整健康状态\n/status — 查看简要状态\n\n示例：\n/batch\n先给我内容\n---\n分析内容\n---\n写下文档")
     if (command.name === "status") return send(`桥接在线。已登记本机 OpenCode 实例：${loadInstances().length}；当前会话：${state.selected?.title || "未选择"}`)
     if (command.name === "health") return send(await healthText())
+    if (command.name === "approvals") {
+      await refreshPermissions()
+      const pending = Object.entries(state.permissionRequests).filter(([, item]) => !item.resolvedAt)
+      if (!pending.length) return send("目前没有等待处理的 OpenCode 审批。")
+      for (const [token, item] of pending.slice(0, 10)) await sendPermissionRequest(token, item, true)
+      return
+    }
     if (command.name === "sessions") return commandSessions(command.arg || 1)
     if (command.name === "find") return commandSessions(1, command.arg)
     if (command.name === "use") {
@@ -617,7 +819,27 @@ async function main() {
     const data = String(query.data || "")
     log("AUDIT", `callback user=${query.from.id} data=${data}`)
     try {
-      if (data === "noop") await telegram("answerCallbackQuery", { callback_query_id: query.id })
+      const permissionMatch = data.match(/^perm:([0-9a-f]{16}):(once|always|reject)$/)
+      if (permissionMatch) {
+        const [, token, reply] = permissionMatch
+        const request = state.permissionRequests[token]
+        if (!request || request.resolvedAt) throw new Error("该审批已处理或已失效")
+        await replyToPermission(request, reply)
+        request.resolvedAt = new Date().toISOString()
+        request.resolution = reply
+        saveState()
+        await telegram("answerCallbackQuery", { callback_query_id: query.id, text: `已处理：${permissionActionText(reply)}` })
+        if (query.message?.message_id) {
+          const text = `${permissionDetails(request)}\n\n${reply === "reject" ? "⛔" : "✅"} 已处理：${permissionActionText(reply)}`
+          await telegram("editMessageText", {
+            chat_id: String(config.allowedChatId),
+            message_id: query.message.message_id,
+            text: compact(text, 3900),
+            reply_markup: { inline_keyboard: [] },
+          }).catch((error) => log("WARN", `unable to update permission message: ${error.message}`))
+        }
+      }
+      else if (data === "noop") await telegram("answerCallbackQuery", { callback_query_id: query.id })
       else if (data === "cancel") await telegram("answerCallbackQuery", { callback_query_id: query.id, text: "已取消" })
       else if (data.startsWith("sessionspage:")) {
         await telegram("answerCallbackQuery", { callback_query_id: query.id })
@@ -811,6 +1033,18 @@ async function main() {
     }
   }
 
+  async function permissionLoop() {
+    while (true) {
+      try {
+        await refreshPermissions()
+      } catch (error) {
+        recordError("permission-monitor", error)
+        log("WARN", `permission monitor failed: ${error.message}`)
+      }
+      await sleep(5000)
+    }
+  }
+
   async function eventLoop() {
     while (true) {
       const files = readdirSync(eventsDir, { withFileTypes: true }).filter((entry) => entry.isFile() && entry.name.endsWith(".json")).map((entry) => entry.name).sort().slice(0, 20)
@@ -893,7 +1127,7 @@ async function main() {
     recordError("telegram-startup", error)
     log("WARN", `Telegram 启动连接失败；桥接保持运行并自动重试：${error.message}`)
   }
-  await Promise.all([telegramLoop(), eventLoop(), recoveryLoop()])
+  await Promise.all([telegramLoop(), eventLoop(), recoveryLoop(), permissionLoop()])
 }
 
 async function check() {
@@ -905,9 +1139,9 @@ async function check() {
   if (!result?.ok) throw new Error("Telegram getMe 失败")
   const commandResult = await requestJson(`https://api.telegram.org/bot${token}/getMyCommands`)
   const commandNames = new Set((commandResult?.result || []).map((item) => item.command))
-  if (!["add", "batch", "find", "health"].every((name) => commandNames.has(name))) throw new Error("Telegram 命令菜单不完整")
+  if (!["add", "batch", "find", "health", "approvals"].every((name) => commandNames.has(name))) throw new Error("Telegram 命令菜单不完整")
   const sessions = await discoverSessions()
-  console.log(`CHECK=PASS BOT=@${result.result.username} INSTANCES=${loadInstances().length} SESSIONS=${sessions.length} COMMANDS=add,batch,find,health`)
+  console.log(`CHECK=PASS BOT=@${result.result.username} INSTANCES=${loadInstances().length} SESSIONS=${sessions.length} COMMANDS=add,batch,find,health,approvals`)
 }
 
 function selfTest() {
@@ -915,6 +1149,7 @@ function selfTest() {
   if (parseCommand("/sessions 2").arg !== 2) throw new Error("parse sessions page failed")
   if (parseCommand("/find paper project").arg !== "paper project") throw new Error("parse find failed")
   if (parseCommand("/health").name !== "health") throw new Error("parse health failed")
+  if (parseCommand("/approvals").name !== "approvals") throw new Error("parse approvals failed")
   if (parseCommand("/send 继续运行测试").arg !== "继续运行测试") throw new Error("parse send failed")
   if (parseCommand("/add 先运行测试").name !== "add") throw new Error("parse add failed")
   if (parseCommand("/batch 先运行测试\n---\n再写文档").name !== "batch") throw new Error("parse batch failed")
@@ -924,6 +1159,8 @@ function selfTest() {
   if (parseCommand("/remove 2").arg !== 2) throw new Error("parse remove failed")
   if (parseCommand("hello") !== null) throw new Error("free text must not execute")
   if (loopbackBase("http://127.0.0.1:4096/path") !== "http://127.0.0.1:4096") throw new Error("loopback normalize failed")
+  if (permissionToken("http://127.0.0.1:4096", "request-1").length !== 16) throw new Error("permission token invalid")
+  if (permissionToken("http://127.0.0.1:4096/path", "request-1") !== permissionToken("http://127.0.0.1:4096", "request-1")) throw new Error("permission token normalization failed")
   let rejected = false
   try { loopbackBase("https://example.com") } catch { rejected = true }
   if (!rejected) throw new Error("remote server must be rejected")

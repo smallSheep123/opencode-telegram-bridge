@@ -11,6 +11,7 @@ OpenCode Desktop
 Local controller
   ├─ long-polls Telegram Bot API
   ├─ reads and retries local completion events
+  ├─ polls pending permission requests and submits explicit replies
   ├─ calls only loopback OpenCode session APIs
   ├─ persists per-session queues and deduplication state
   └─ sends notifications and inline actions
@@ -40,7 +41,16 @@ Runtime data is stored under:
 └─ logs\
 ```
 
-`config.json` contains the Telegram identity binding and a DPAPI-protected token. Instance files contain loopback connection metadata and a DPAPI-protected temporary OpenCode Desktop credential. `state.json` contains Telegram offsets, session selection, queues, recovery metadata, and processed event IDs.
+`config.json` contains the Telegram identity binding and a DPAPI-protected token. Instance files contain loopback connection metadata and a DPAPI-protected temporary OpenCode Desktop credential. `state.json` contains Telegram offsets, session selection, queues, recovery metadata, processed event IDs, and short mappings for pending permission callbacks.
+
+## Permission lifecycle
+
+1. The controller polls the loopback `/permission` endpoint for each registered project context.
+2. A new request is persisted and sent only to the bound private Telegram chat.
+3. Telegram callback data contains a 16-character local mapping token and the selected reply; it does not contain the request body, session ID, or credential.
+4. The controller resolves the token, checks the Telegram identity again, and submits `once`, `always`, or `reject` to OpenCode.
+5. Resolved requests are marked before the message buttons are removed, which makes repeated clicks idempotent.
+6. The controller supports the current permission reply endpoint and the legacy session permission endpoint.
 
 ## Queue lifecycle
 

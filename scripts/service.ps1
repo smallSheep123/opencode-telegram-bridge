@@ -13,19 +13,35 @@ $DataRoot = "$env:USERPROFILE\.config\opencode\telegram-bridge"
 $ConfigPath = Join-Path $DataRoot 'config.json'
 
 function Get-BridgeTask { Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
+function Get-BridgeControllerProcess {
+    $controllerPath = [IO.Path]::GetFullPath($Controller)
+    Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue | Where-Object {
+        $_.CommandLine -and $_.CommandLine.IndexOf($controllerPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    }
+}
 function Stop-BridgeTask {
-    if (-not (Get-BridgeTask)) { return }
-    Stop-ScheduledTask $TaskName -ErrorAction SilentlyContinue
     $lockPath = Join-Path $DataRoot 'controller.lock'
-    for ($i = 0; $i -lt 50; $i++) {
-        $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State
-        if ($state -ne 'Running') { break }
-        Start-Sleep -Milliseconds 100
+    $lockedPid = 0
+    if (Test-Path -LiteralPath $lockPath) {
+        $rawPid = Get-Content -LiteralPath $lockPath -Raw -ErrorAction SilentlyContinue
+        [void][int]::TryParse(([string]$rawPid).Trim(), [ref]$lockedPid)
     }
-    # The task is stopped, so any remaining lock belongs to its terminated process.
-    if ((Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue).State -ne 'Running') {
-        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    if (Get-BridgeTask) { Stop-ScheduledTask $TaskName -ErrorAction SilentlyContinue }
+    Start-Sleep -Milliseconds 500
+    # Task Scheduler can stop the PowerShell launcher while leaving node.exe alive.
+    # Only terminate node processes whose command line contains this installation's exact controller path.
+    $targets = @(Get-BridgeControllerProcess)
+    if ($lockedPid -gt 0 -and -not ($targets.ProcessId -contains $lockedPid)) {
+        $locked = Get-CimInstance Win32_Process -Filter "ProcessId = $lockedPid" -ErrorAction SilentlyContinue
+        if ($locked.Name -eq 'node.exe' -and $locked.CommandLine -and $locked.CommandLine.IndexOf([IO.Path]::GetFullPath($Controller), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $targets += $locked
+        }
     }
+    foreach ($process in @($targets | Sort-Object ProcessId -Unique)) {
+        Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction SilentlyContinue
+    }
+    for ($i = 0; $i -lt 20 -and @(Get-BridgeControllerProcess).Count -gt 0; $i++) { Start-Sleep -Milliseconds 100 }
+    if (@(Get-BridgeControllerProcess).Count -eq 0) { Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue }
 }
 function Show-Status {
     $task = Get-BridgeTask
